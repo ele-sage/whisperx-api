@@ -1,0 +1,43 @@
+[project]
+name = "whisperx-api"
+version = "0.1.0"
+description = "Standalone FastAPI wrapper for WhisperX with synchronous endpoints, global GPU locking, and cached models."
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi[standard]>=0.135.1",
+    "python-multipart==0.0.22",
+    "whisperx==3.8.1",
+    "torch<=2.8.0",
+    "torchaudio==2.8.0",
+]
+
+[tool.uv]
+override-dependencies = [
+    "torchcodec>=0.6.0; (sys_platform == 'linux' and platform_machine == 'x86_64') or sys_platform == 'darwin' or sys_platform == 'win32'",
+]
+
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cpu", marker = "sys_platform == 'darwin'" },
+  { index = "pytorch-cpu", marker = "platform_machine != 'x86_64' and sys_platform != 'darwin'" },
+  { index = "pytorch", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
+]
+torchaudio = [
+  { index = "pytorch-cpu", marker = "sys_platform == 'darwin'" },
+  { index = "pytorch-cpu", marker = "platform_machine != 'x86_64' and sys_platform != 'darwin'" },
+  { index = "pytorch", marker = "platform_machine == 'x86_64' and sys_platform != 'darwin'" },
+]
+triton = [
+  { index = "pytorch", marker = "sys_platform == 'linux'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true

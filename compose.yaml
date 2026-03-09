@@ -1,0 +1,23 @@
+services:
+  whisperx-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: whisperx-api
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    container_name: whisperx-api
+    env_file:
+      - .env
+    ports:
+      - "${FORWARD_PORT:-8000}:8000"
+    volumes:
+      - "/data/whisperx/cache:/root/.cache"
+      - "$HOME/.cache/huggingface:/root/.cache/huggingface"
+    tmpfs:
+      - /tmp:size=512m,mode=1777,noexec,nosuid,nodev

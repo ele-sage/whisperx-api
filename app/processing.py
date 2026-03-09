@@ -1,0 +1,385 @@
+"""Synchronous speech-to-text processing pipeline with cached models.
+
+Models are loaded lazily on first use and cached across requests for
+performance.  All GPU work runs inside a single global lock so concurrent
+requests are queued safely.
+
+Optimizations:
+- Audio loading (CPU/IO) runs OUTSIDE the GPU lock.
+- Speaker assignment (CPU-only) runs OUTSIDE the GPU lock.
+- Transcription model: cached, NOT reloaded on language change (Whisper
+  is multilingual — language is a transcribe-time parameter).
+- Alignment model: caches up to 2 languages simultaneously (LRU eviction).
+- Diarization model: cached, reloaded only on device change.
+"""
+
+import gc
+import logging
+from collections import OrderedDict
+from typing import Any, List
+
+import numpy as np
+import torch
+import whisperx
+from whisperx import align, load_align_model, load_audio, load_model
+from whisperx.diarize import DiarizationPipeline
+
+from app.audio import (
+    is_stereo_audio,
+    process_audio_file,
+    safe_remove_file,
+    split_stereo_to_mono,
+)
+from app.config import HF_TOKEN
+from app.gpu_lock import gpu_lock
+from app.schemas import (
+    AlignedTranscription,
+    AlignmentParams,
+    ASROptions,
+    DiarizationParams,
+    LabeledSegment,
+    LabeledWord,
+    VADOptions,
+    WhisperModelParams,
+)
+from app.transcript import filter_aligned_transcription
+
+logger = logging.getLogger("app")
+
+_MAX_CACHED_ALIGNMENT_LANGUAGES = 2
+
+
+# ── Cached model holders ─────────────────────────────────────────────
+
+
+class TranscriptionModel:
+    """Lazily loaded, cached WhisperX transcription model.
+
+    The Whisper model is multilingual — language is only a parameter
+    passed at transcribe time, NOT at model load time.  So we do NOT
+    reload the model when the requested language changes.
+    """
+
+    def __init__(self) -> None:
+        self.model: Any = None
+        self._config: dict[str, Any] | None = None
+
+    def _should_reload(
+        self,
+        model: str,
+        device: str,
+        device_index: int,
+        compute_type: str,
+        task: str,
+    ) -> bool:
+        if self.model is None or self._config is None:
+            return True
+        return self._config != {
+            "model": model,
+            "device": device,
+            "device_index": device_index,
+            "compute_type": compute_type,
+            "task": task,
+        }
+
+    def transcribe(
+        self,
+        audio: np.ndarray[Any, np.dtype[np.float32]],
+        params: WhisperModelParams,
+        asr_options: ASROptions,
+        vad_options: VADOptions,
+    ) -> dict[str, Any]:
+        """Transcribe audio. Must be called while holding the GPU lock."""
+        faster_whisper_threads = 4
+        if params.threads > 0:
+            torch.set_num_threads(params.threads)
+            faster_whisper_threads = params.threads
+
+        if self._should_reload(
+            params.model.value,
+            params.device.value,
+            params.device_index,
+            params.compute_type.value,
+            params.task.value,
+        ):
+            if self.model is not None:
+                self.model = None
+                gc.collect()
+                torch.cuda.empty_cache()
+
+            logger.info(
+                "Loading transcription model %s on %s",
+                params.model.value,
+                params.device.value,
+            )
+            self.model = load_model(
+                params.model.value,
+                params.device.value,
+                device_index=params.device_index,
+                compute_type=params.compute_type.value,
+                asr_options=asr_options.model_dump(),
+                vad_options=vad_options.model_dump(),
+                language=None,
+                task=params.task.value,
+                threads=faster_whisper_threads,
+            )
+            self._config = {
+                "model": params.model.value,
+                "device": params.device.value,
+                "device_index": params.device_index,
+                "compute_type": params.compute_type.value,
+                "task": params.task.value,
+            }
+        else:
+            logger.debug("Reusing cached transcription model")
+
+        result = self.model.transcribe(
+            audio=audio,
+            batch_size=params.batch_size,
+            chunk_size=params.chunk_size,
+            language=params.language,
+        )
+        return result  # type: ignore[no-any-return]
+
+
+class AlignmentModel:
+    """Lazily loaded, multi-language cached WhisperX alignment model.
+
+    Caches up to ``_MAX_CACHED_ALIGNMENT_LANGUAGES`` alignment models
+    simultaneously (keyed by language + device).  When the cache is
+    full, the least-recently-used model is evicted.
+    """
+
+    def __init__(self, max_cached: int = _MAX_CACHED_ALIGNMENT_LANGUAGES) -> None:
+        self._max_cached = max_cached
+        # key = (language_code, device), value = (model, metadata)
+        self._cache: OrderedDict[tuple[str, str], tuple[Any, Any]] = OrderedDict()
+
+    def _get_or_load(
+        self,
+        language_code: str,
+        device: str,
+        align_model_name: str | None,
+    ) -> tuple[Any, Any]:
+        """Return a cached (model, metadata) or load a new one."""
+        key = (language_code, device)
+
+        if key in self._cache:
+            # Move to end (most recently used)
+            self._cache.move_to_end(key)
+            logger.debug("Reusing cached alignment model for %s", language_code)
+            return self._cache[key]
+
+        # Evict oldest if at capacity
+        if len(self._cache) >= self._max_cached:
+            evicted_key, (old_model, old_meta) = self._cache.popitem(last=False)
+            logger.info("Evicting alignment model for %s (LRU)", evicted_key[0])
+            del old_model, old_meta
+            gc.collect()
+            torch.cuda.empty_cache()
+
+        logger.info("Loading alignment model for %s on %s", language_code, device)
+        model, metadata = load_align_model(
+            language_code=language_code,
+            device=device,
+            model_name=align_model_name,
+        )
+        self._cache[key] = (model, metadata)
+        return model, metadata
+
+    def align(
+        self,
+        transcript: list[dict[str, Any]],
+        audio: np.ndarray[Any, np.dtype[np.float32]],
+        language_code: str,
+        device: str,
+        align_params: AlignmentParams,
+    ) -> dict[str, Any]:
+        """Align transcript to audio. Must be called while holding the GPU lock."""
+        model, metadata = self._get_or_load(
+            language_code, device, align_params.align_model,
+        )
+
+        result = align(
+            transcript,
+            model,
+            metadata,
+            audio,
+            device,
+            interpolate_method=align_params.interpolate_method.value,
+            return_char_alignments=align_params.return_char_alignments,
+        )
+
+        logger.debug("Completed alignment")
+        return result  # type: ignore[no-any-return]
+
+
+class DiarizationModel:
+    """Lazily loaded, cached PyAnnote diarization pipeline."""
+
+    def __init__(self, hf_token: str | None) -> None:
+        self.hf_token = hf_token
+        self.model: Any = None
+        self._device: str | None = None
+
+    def diarize(
+        self,
+        audio: np.ndarray[Any, np.dtype[np.float32]],
+        device: str,
+        min_speakers: int | None = None,
+        max_speakers: int | None = None,
+    ) -> Any:
+        """Diarize audio. Must be called while holding the GPU lock."""
+        if self.model is None or self._device != device:
+            if self.model is not None:
+                del self.model
+                self.model = None
+                gc.collect()
+                torch.cuda.empty_cache()
+
+            logger.info("Loading diarization model on %s", device)
+            self.model = DiarizationPipeline(
+                use_auth_token=self.hf_token, device=device
+            )
+            self._device = device
+        else:
+            logger.debug("Reusing cached diarization model")
+
+        return self.model(
+            audio=audio, min_speakers=min_speakers, max_speakers=max_speakers
+        )
+
+
+# ── Global model instances ───────────────────────────────────────────
+
+transcription_model = TranscriptionModel()
+alignment_model = AlignmentModel()
+diarization_model = DiarizationModel(hf_token=HF_TOKEN)
+
+
+# ── Pipeline functions ───────────────────────────────────────────────
+
+
+def run_speech_to_text(
+    temp_file: str,
+    model_params: WhisperModelParams,
+    align_params: AlignmentParams,
+    diarize_params: DiarizationParams,
+    asr_options: ASROptions,
+    vad_options: VADOptions,
+    split_audio: bool = False,
+) -> dict[str, Any]:
+    """Run the full speech-to-text pipeline synchronously.
+
+    Audio loading happens OUTSIDE the GPU lock so the next request's
+    audio can be read while the current one is still on the GPU.
+    """
+    if split_audio and is_stereo_audio(temp_file):
+        return _run_split_audio(
+            temp_file, model_params, align_params, diarize_params,
+            asr_options, vad_options,
+        )
+
+    # ── Audio loading (CPU/IO — no lock needed) ──
+    audio = process_audio_file(temp_file)
+
+    # ── GPU work (transcribe + align + diarize) ──
+    with gpu_lock():
+        raw = transcription_model.transcribe(audio, model_params, asr_options, vad_options)
+
+        aligned = alignment_model.align(
+            transcript=raw["segments"],
+            audio=audio,
+            language_code=raw["language"],
+            device=model_params.device.value,
+            align_params=align_params,
+        )
+
+        transcript = AlignedTranscription(**aligned)
+        filtered = filter_aligned_transcription(transcript)
+        transcript_dict = filtered.model_dump()
+
+        diarization_segments = diarization_model.diarize(
+            audio=audio,
+            device=model_params.device.value,
+            min_speakers=diarize_params.min_speakers,
+            max_speakers=diarize_params.max_speakers,
+        )
+
+    # ── Speaker assignment (CPU-only — no lock needed) ──
+    result = whisperx.assign_word_speakers(diarization_segments, transcript_dict)
+    return result  # type: ignore[no-any-return]
+
+
+def _run_split_audio(
+    temp_file: str,
+    model_params: WhisperModelParams,
+    align_params: AlignmentParams,
+    diarize_params: DiarizationParams,
+    asr_options: ASROptions,
+    vad_options: VADOptions,
+) -> dict[str, Any]:
+    """Split stereo → process L/R channels → merge results."""
+    left_file, right_file = split_stereo_to_mono(temp_file)
+
+    channels: dict[str, AlignedTranscription] = {}
+    for channel_name, channel_file in [("left", left_file), ("right", right_file)]:
+        # ── Audio loading (CPU/IO — no lock needed) ──
+        try:
+            audio = load_audio(channel_file)
+
+        finally:
+            safe_remove_file(channel_file)
+
+        # ── GPU work (transcribe + align only for channels) ──
+        with gpu_lock():
+            raw = transcription_model.transcribe(audio, model_params, asr_options, vad_options)
+
+            aligned = alignment_model.align(
+                transcript=raw["segments"],
+                audio=audio,
+                language_code=raw["language"],
+                device=model_params.device.value,
+                align_params=align_params,
+            )
+
+        # ── Filtering (CPU — no lock needed) ──
+        transcript = AlignedTranscription(**aligned)
+        filtered = filter_aligned_transcription(transcript, channel_name)
+        channels[channel_name] = filtered
+
+    merged = _merge_channel_results(channels)
+    return merged.model_dump()
+
+
+def _merge_channel_results(
+    channels: dict[str, AlignedTranscription],
+) -> AlignedTranscription:
+    """Merge transcription results from multiple channels."""
+    merged_segments: List[LabeledSegment] = []
+    merged_words: List[LabeledWord] = []
+
+    for channel, transcription in channels.items():
+        for segment in transcription.segments:
+            new_segment = LabeledSegment(
+                **segment.model_dump(exclude={"speaker", "words"}),
+                words=[],
+                speaker=channel,
+            )
+            if segment.words:
+                new_segment.words = [
+                    LabeledWord(**w.model_dump(exclude={"speaker"}), speaker=channel)
+                    for w in segment.words
+                ]
+            merged_segments.append(new_segment)
+
+        if transcription.word_segments:
+            for word in transcription.word_segments:
+                merged_words.append(
+                    LabeledWord(**word.model_dump(exclude={"speaker"}), speaker=channel)
+                )
+
+    merged_segments.sort(key=lambda s: s.start or 0.0)
+    merged_words.sort(key=lambda w: w.start or 0.0)
+
+    return AlignedTranscription(segments=merged_segments, word_segments=merged_words)
