@@ -18,9 +18,10 @@ from contextlib import asynccontextmanager
 from tempfile import NamedTemporaryFile
 
 from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile, status
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
 
-from app.audio import safe_remove_file, validate_extension
+from app.audio import get_audio_duration_from_file, safe_remove_file, validate_extension
 from app.config import ALLOWED_EXTENSIONS
 from app.processing import run_speech_to_text
 from app.schemas import (
@@ -63,6 +64,8 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 
 # ── Endpoints ────────────────────────────────────────────────────────
@@ -109,6 +112,9 @@ def speech_to_text(
     logger.info("Received file: %s (%s)", file.filename, temp_path)
 
     try:
+        duration = get_audio_duration_from_file(temp_path)
+        start_time = time.time()
+        
         result = run_speech_to_text(
             temp_file=temp_path,
             model_params=model_params,
@@ -118,7 +124,15 @@ def speech_to_text(
             vad_options=vad_options,
             split_audio=split_audio,
         )
-        return {"status": "completed", **result}
+        
+        processing_time = time.time() - start_time
+        
+        return {
+            "status": "completed",
+            "duration": duration,
+            "processing_time": processing_time,
+            **result
+        }
     except Exception as exc:
         logger.exception("Processing failed for %s", file.filename)
         return JSONResponse(

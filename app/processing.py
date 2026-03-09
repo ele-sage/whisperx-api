@@ -15,6 +15,7 @@ Optimizations:
 
 import gc
 import logging
+import time
 from collections import OrderedDict
 from typing import Any, List
 
@@ -132,7 +133,12 @@ class TranscriptionModel:
             }
         else:
             logger.debug("Reusing cached transcription model")
-
+        logger.debug(
+            "Transcribing audio with batch_size=%s, chunk_size=%s, language=%s",
+            params.batch_size,
+            params.chunk_size,
+            params.language,
+        )
         result = self.model.transcribe(
             audio=audio,
             batch_size=params.batch_size,
@@ -196,6 +202,7 @@ class AlignmentModel:
         align_params: AlignmentParams,
     ) -> dict[str, Any]:
         """Align transcript to audio. Must be called while holding the GPU lock."""
+        start_time = time.time()
         model, metadata = self._get_or_load(
             language_code, device, align_params.align_model,
         )
@@ -210,7 +217,7 @@ class AlignmentModel:
             return_char_alignments=align_params.return_char_alignments,
         )
 
-        logger.debug("Completed alignment")
+        logger.debug("Completed alignment in %.2fs", time.time() - start_time)
         return result  # type: ignore[no-any-return]
 
 
@@ -245,9 +252,12 @@ class DiarizationModel:
         else:
             logger.debug("Reusing cached diarization model")
 
-        return self.model(
+        start_time = time.time()
+        result = self.model(
             audio=audio, min_speakers=min_speakers, max_speakers=max_speakers
         )
+        logger.debug("Completed diarization in %.2fs", time.time() - start_time)
+        return result
 
 
 # ── Global model instances ───────────────────────────────────────────
@@ -281,11 +291,18 @@ def run_speech_to_text(
         )
 
     # ── Audio loading (CPU/IO — no lock needed) ──
+    start_cpu_io = time.time()
     audio = process_audio_file(temp_file)
+    audio_load_time = time.time() - start_cpu_io
+    logger.debug("Audio loaded in %.2fs", audio_load_time)
 
     # ── GPU work (transcribe + align + diarize) ──
     with gpu_lock():
+        start_gpu = time.time()
+        
+        start_transcribe = time.time()
         raw = transcription_model.transcribe(audio, model_params, asr_options, vad_options)
+        logger.debug("Transcription step took %.2fs", time.time() - start_transcribe)
 
         aligned = alignment_model.align(
             transcript=raw["segments"],
@@ -305,9 +322,13 @@ def run_speech_to_text(
             min_speakers=diarize_params.min_speakers,
             max_speakers=diarize_params.max_speakers,
         )
+        logger.debug("Total GPU lock time: %.2fs", time.time() - start_gpu)
 
     # ── Speaker assignment (CPU-only — no lock needed) ──
+    start_assign = time.time()
     result = whisperx.assign_word_speakers(diarization_segments, transcript_dict)
+    logger.debug("Speaker assignment took %.2fs", time.time() - start_assign)
+    
     return result  # type: ignore[no-any-return]
 
 

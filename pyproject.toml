@@ -10,6 +10,7 @@ dependencies = [
     "whisperx==3.8.1",
     "torch<=2.8.0",
     "torchaudio==2.8.0",
+    "python-dotenv>=1.2.2",
 ]
 
 [tool.uv]
