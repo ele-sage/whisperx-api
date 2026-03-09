@@ -10,6 +10,7 @@ Start with::
     uvicorn app.main:app --host 0.0.0.0 --port 8001
 """
 
+import gc
 import logging
 import os
 import time
@@ -17,6 +18,7 @@ from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from tempfile import NamedTemporaryFile
 
+import torch
 from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile, status
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
@@ -146,6 +148,9 @@ def speech_to_text(
         )
     finally:
         safe_remove_file(temp_path)
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 @app.get("/health", tags=["Health"])

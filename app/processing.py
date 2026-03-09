@@ -328,6 +328,9 @@ def run_speech_to_text(
         )
     logger.debug("Total GPU processing time: %.2fs", time.time() - start_gpu)
 
+    # Free memory explicitly before CPU intensive speaker assignment
+    del audio
+    
     # ── Speaker assignment (CPU-only — no lock needed) ──
     start_assign = time.time()
     result = whisperx.assign_word_speakers(diarization_segments, transcript_dict)
