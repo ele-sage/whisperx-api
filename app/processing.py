@@ -22,6 +22,8 @@ from typing import Any, List
 import numpy as np
 import torch
 import whisperx
+
+
 from whisperx import align, load_align_model, load_audio, load_model
 from whisperx.diarize import DiarizationPipeline
 
@@ -32,7 +34,7 @@ from app.audio import (
     split_stereo_to_mono,
 )
 from app.config import HF_TOKEN
-from app.gpu_lock import gpu_lock
+from app.gpu_lock import alignment_lock, diarization_lock, transcription_lock
 from app.schemas import (
     AlignedTranscription,
     AlignmentParams,
@@ -48,6 +50,16 @@ from app.transcript import filter_aligned_transcription
 logger = logging.getLogger("app")
 
 _MAX_CACHED_ALIGNMENT_LANGUAGES = 2
+
+
+def _force_enable_tf32() -> None:
+    """Re-enable TF32 after pyannote disables it during model init.
+
+    Pyannote disables TF32 globally for reproducibility, but for a production
+    transcription API the ~2-3x speed gain on Ampere+ GPUs is worth it.
+    """
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
 
 
 # ── Cached model holders ─────────────────────────────────────────────
@@ -124,6 +136,8 @@ class TranscriptionModel:
                 task=params.task.value,
                 threads=faster_whisper_threads,
             )
+            # Pyannote (loaded inside load_model) disables TF32 — re-enable it.
+            _force_enable_tf32()
             self._config = {
                 "model": params.model.value,
                 "device": params.device.value,
@@ -297,13 +311,14 @@ def run_speech_to_text(
     logger.debug("Audio loaded in %.2fs", audio_load_time)
 
     # ── GPU work (transcribe + align + diarize) ──
-    with gpu_lock():
-        start_gpu = time.time()
-        
+    start_gpu = time.time()
+    
+    with transcription_lock():
         start_transcribe = time.time()
         raw = transcription_model.transcribe(audio, model_params, asr_options, vad_options)
         logger.debug("Transcription step took %.2fs", time.time() - start_transcribe)
 
+    with alignment_lock():
         aligned = alignment_model.align(
             transcript=raw["segments"],
             audio=audio,
@@ -312,17 +327,18 @@ def run_speech_to_text(
             align_params=align_params,
         )
 
-        transcript = AlignedTranscription(**aligned)
-        filtered = filter_aligned_transcription(transcript)
-        transcript_dict = filtered.model_dump()
+    transcript = AlignedTranscription(**aligned)
+    filtered = filter_aligned_transcription(transcript)
+    transcript_dict = filtered.model_dump()
 
+    with diarization_lock():
         diarization_segments = diarization_model.diarize(
             audio=audio,
             device=model_params.device.value,
             min_speakers=diarize_params.min_speakers,
             max_speakers=diarize_params.max_speakers,
         )
-        logger.debug("Total GPU lock time: %.2fs", time.time() - start_gpu)
+    logger.debug("Total GPU processing time: %.2fs", time.time() - start_gpu)
 
     # ── Speaker assignment (CPU-only — no lock needed) ──
     start_assign = time.time()
@@ -344,28 +360,63 @@ def _run_split_audio(
     left_file, right_file = split_stereo_to_mono(temp_file)
 
     channels: dict[str, AlignedTranscription] = {}
+    
+    # ── Audio loading (CPU/IO) ──
+    # Load both channels outside the GPU lock simultaneously
+    audio_data = {}
     for channel_name, channel_file in [("left", left_file), ("right", right_file)]:
-        # ── Audio loading (CPU/IO — no lock needed) ──
         try:
-            audio = load_audio(channel_file)
-
+            audio_data[channel_name] = load_audio(channel_file)
         finally:
             safe_remove_file(channel_file)
 
-        # ── GPU work (transcribe + align only for channels) ──
-        with gpu_lock():
-            raw = transcription_model.transcribe(audio, model_params, asr_options, vad_options)
+    # ── GPU work (transcribe + align interleaved) ──
+    # Pipeline: Transcribe L → [Align L ∥ Transcribe R] → Align R
+    # CTranslate2 and PyTorch both release the GIL during GPU ops, so
+    # alignment (Wav2Vec2) can overlap with transcription (CTranslate2)
+    # on the same GPU because they now use separate locks.
+    aligned_results = {}
 
-            aligned = alignment_model.align(
+    # 1. Transcribe left channel
+    with transcription_lock():
+        raw_left = transcription_model.transcribe(
+            audio_data["left"], model_params, asr_options, vad_options,
+        )
+
+    from concurrent.futures import Future, ThreadPoolExecutor
+
+    def _align_channel(channel_name: str, raw: dict[str, Any]) -> dict[str, Any]:
+        with alignment_lock():
+            return alignment_model.align(
                 transcript=raw["segments"],
-                audio=audio,
+                audio=audio_data[channel_name],
                 language_code=raw["language"],
                 device=model_params.device.value,
                 align_params=align_params,
             )
 
-        # ── Filtering (CPU — no lock needed) ──
-        transcript = AlignedTranscription(**aligned)
+    # 2. Start aligning left in a background thread while we transcribe right
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future_left = executor.submit(_align_channel, "left", raw_left)
+
+        # 3. Transcribe right channel (overlaps with left alignment)
+        with transcription_lock():
+            raw_right = transcription_model.transcribe(
+                audio_data["right"], model_params, asr_options, vad_options,
+            )
+
+        # 4. Right transcription done. We can align right now.
+        aligned_right = _align_channel("right", raw_right)
+
+        # 5. Collect left alignment result (it should already be done by now)
+        aligned_left = future_left.result()
+
+    aligned_results["left"] = aligned_left
+    aligned_results["right"] = aligned_right
+
+    # ── Filtering (CPU — no lock needed) ──
+    for channel_name in ["left", "right"]:
+        transcript = AlignedTranscription(**aligned_results[channel_name])
         filtered = filter_aligned_transcription(transcript, channel_name)
         channels[channel_name] = filtered
 

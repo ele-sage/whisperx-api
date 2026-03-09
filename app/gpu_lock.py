@@ -12,17 +12,45 @@ import logging
 
 logger = logging.getLogger("app")
 
-_gpu_lock = threading.Lock()
+_transcription_lock = threading.Lock()
+_alignment_lock = threading.Lock()
+_diarization_lock = threading.Lock()
 
 
 @contextmanager
-def gpu_lock() -> Generator[None, None, None]:
-    """Acquire the global GPU lock, blocking until it is available."""
-    logger.debug("Waiting to acquire GPU lock...")
-    _gpu_lock.acquire()
-    logger.debug("GPU lock acquired.")
+def transcription_lock() -> Generator[None, None, None]:
+    """Acquire the GPU lock for transcription."""
+    logger.debug("Waiting to acquire transcription lock...")
+    _transcription_lock.acquire()
+    logger.debug("Transcription lock acquired.")
     try:
         yield
     finally:
-        _gpu_lock.release()
-        logger.debug("GPU lock released.")
+        _transcription_lock.release()
+        logger.debug("Transcription lock released.")
+
+
+@contextmanager
+def alignment_lock() -> Generator[None, None, None]:
+    """Acquire the GPU lock for alignment."""
+    logger.debug("Waiting to acquire alignment lock...")
+    _alignment_lock.acquire()
+    logger.debug("Alignment lock acquired.")
+    try:
+        yield
+    finally:
+        _alignment_lock.release()
+        logger.debug("Alignment lock released.")
+
+
+@contextmanager
+def diarization_lock() -> Generator[None, None, None]:
+    """Acquire the GPU lock for diarization."""
+    logger.debug("Waiting to acquire diarization lock...")
+    _diarization_lock.acquire()
+    logger.debug("Diarization lock acquired.")
+    try:
+        yield
+    finally:
+        _diarization_lock.release()
+        logger.debug("Diarization lock released.")
