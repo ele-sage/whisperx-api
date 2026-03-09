@@ -130,14 +130,19 @@ def speech_to_text(
         return {
             "status": "completed",
             "duration": duration,
-            "processing_time": processing_time,
+            "processing_time": round(processing_time, 3),
             **result
         }
     except Exception as exc:
         logger.exception("Processing failed for %s", file.filename)
         return JSONResponse(
             status_code=500,
-            content={"status": "failed", "error": str(exc)},
+            content={
+                "status": "failed",
+                "error": str(exc),
+                "segments": [],
+                "word_segments": [],
+            },
         )
     finally:
         safe_remove_file(temp_path)

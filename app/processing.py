@@ -52,16 +52,6 @@ logger = logging.getLogger("app")
 _MAX_CACHED_ALIGNMENT_LANGUAGES = 2
 
 
-def _force_enable_tf32() -> None:
-    """Re-enable TF32 after pyannote disables it during model init.
-
-    Pyannote disables TF32 globally for reproducibility, but for a production
-    transcription API the ~2-3x speed gain on Ampere+ GPUs is worth it.
-    """
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
-
-
 # ── Cached model holders ─────────────────────────────────────────────
 
 
@@ -136,8 +126,6 @@ class TranscriptionModel:
                 task=params.task.value,
                 threads=faster_whisper_threads,
             )
-            # Pyannote (loaded inside load_model) disables TF32 — re-enable it.
-            _force_enable_tf32()
             self._config = {
                 "model": params.model.value,
                 "device": params.device.value,
@@ -370,22 +358,18 @@ def _run_split_audio(
         finally:
             safe_remove_file(channel_file)
 
-    # ── GPU work (transcribe + align interleaved) ──
-    # Pipeline: Transcribe L → [Align L ∥ Transcribe R] → Align R
-    # CTranslate2 and PyTorch both release the GIL during GPU ops, so
-    # alignment (Wav2Vec2) can overlap with transcription (CTranslate2)
-    # on the same GPU because they now use separate locks.
-    aligned_results = {}
+    from concurrent.futures import ThreadPoolExecutor
 
-    # 1. Transcribe left channel
-    with transcription_lock():
-        raw_left = transcription_model.transcribe(
-            audio_data["left"], model_params, asr_options, vad_options,
-        )
-
-    from concurrent.futures import Future, ThreadPoolExecutor
-
-    def _align_channel(channel_name: str, raw: dict[str, Any]) -> dict[str, Any]:
+    def _process_channel(channel_name: str) -> dict[str, Any]:
+        """Transcribe and align a single channel sequentially."""
+        # 1. Transcribe (mutually exclusive with other transcriptions)
+        with transcription_lock():
+            raw = transcription_model.transcribe(
+                audio_data[channel_name], model_params, asr_options, vad_options,
+            )
+            
+        # 2. Align (mutually exclusive with other alignments, but CAN overlap 
+        #    with the OTHER channel's transcription)
         with alignment_lock():
             return alignment_model.align(
                 transcript=raw["segments"],
@@ -395,24 +379,15 @@ def _run_split_audio(
                 align_params=align_params,
             )
 
-    # 2. Start aligning left in a background thread while we transcribe right
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        future_left = executor.submit(_align_channel, "left", raw_left)
-
-        # 3. Transcribe right channel (overlaps with left alignment)
-        with transcription_lock():
-            raw_right = transcription_model.transcribe(
-                audio_data["right"], model_params, asr_options, vad_options,
-            )
-
-        # 4. Right transcription done. We can align right now.
-        aligned_right = _align_channel("right", raw_right)
-
-        # 5. Collect left alignment result (it should already be done by now)
-        aligned_left = future_left.result()
-
-    aligned_results["left"] = aligned_left
-    aligned_results["right"] = aligned_right
+    # ── GPU work (transcribe + align interleaved) ──
+    # By running both channels concurrently in threads, the separate locks 
+    # naturally create an interleaved pipeline:
+    # Thread L: [Transcribe Lock] -> [Align Lock]
+    # Thread R: (Waits for Trans Lock) -> [Transcribe Lock] -> [Align Lock]
+    aligned_results = {}
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        for channel_name, result in zip(["left", "right"], executor.map(_process_channel, ["left", "right"])):
+            aligned_results[channel_name] = result
 
     # ── Filtering (CPU — no lock needed) ──
     for channel_name in ["left", "right"]:
