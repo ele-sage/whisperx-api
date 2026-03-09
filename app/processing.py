@@ -246,7 +246,7 @@ class DiarizationModel:
 
             logger.info("Loading diarization model on %s", device)
             self.model = DiarizationPipeline(
-                use_auth_token=self.hf_token, device=device
+                token=self.hf_token, device=device
             )
             self._device = device
         else:
