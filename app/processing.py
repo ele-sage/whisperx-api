@@ -352,11 +352,12 @@ def _run_split_audio(
     # ── Audio loading (CPU/IO) ──
     # Load both channels outside the GPU lock simultaneously
     audio_data = {}
-    for channel_name, channel_file in [("left", left_file), ("right", right_file)]:
-        try:
+    try:
+        for channel_name, channel_file in [("left", left_file), ("right", right_file)]:
             audio_data[channel_name] = load_audio(channel_file)
-        finally:
-            safe_remove_file(channel_file)
+    finally:
+        safe_remove_file(left_file)
+        safe_remove_file(right_file)
 
     from concurrent.futures import ThreadPoolExecutor
 

@@ -49,9 +49,11 @@ def process_audio_file(audio_file: str) -> np.ndarray[Any, np.dtype[np.float32]]
     if ext in VIDEO_EXTENSIONS:
         converted_file = convert_video_to_audio(audio_file)
         audio_file = converted_file
-    audio = load_audio(audio_file)
-    if converted_file:
-        safe_remove_file(converted_file)
+    try:
+        audio = load_audio(audio_file)
+    finally:
+        if converted_file:
+            safe_remove_file(converted_file)
     return audio  # type: ignore[no-any-return]
 
 
