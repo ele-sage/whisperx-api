@@ -286,12 +286,13 @@ def run_speech_to_text(
     Audio loading happens OUTSIDE the GPU lock so the next request's
     audio can be read while the current one is still on the GPU.
     """
-    if split_audio and is_stereo_audio(temp_file):
+    stereo = is_stereo_audio(temp_file)
+    if split_audio and stereo:
         result = _run_split_audio(
             temp_file, model_params, align_params, diarize_params,
             asr_options, vad_options,
         )
-        result["is_stereo"] = True
+        result["is_stereo"] = stereo
         return result
 
     # ── Audio loading (CPU/IO — no lock needed) ──
