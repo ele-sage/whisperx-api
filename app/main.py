@@ -14,17 +14,10 @@ import gc
 import logging
 import os
 import time
-import warnings
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from tempfile import NamedTemporaryFile
 
-warnings.filterwarnings(
-    "ignore",
-    message="torchcodec is not installed correctly",
-    category=UserWarning,
-    module="pyannote",
-)
 
 import torch
 from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile, status
