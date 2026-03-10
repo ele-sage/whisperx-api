@@ -287,10 +287,12 @@ def run_speech_to_text(
     audio can be read while the current one is still on the GPU.
     """
     if split_audio and is_stereo_audio(temp_file):
-        return _run_split_audio(
+        result = _run_split_audio(
             temp_file, model_params, align_params, diarize_params,
             asr_options, vad_options,
         )
+        result["is_stereo"] = True
+        return result
 
     # ── Audio loading (CPU/IO — no lock needed) ──
     start_cpu_io = time.time()
@@ -335,7 +337,8 @@ def run_speech_to_text(
     start_assign = time.time()
     result = whisperx.assign_word_speakers(diarization_segments, transcript_dict)
     logger.debug("Speaker assignment took %.2fs", time.time() - start_assign)
-    
+
+    result["is_stereo"] = stereo
     return result  # type: ignore[no-any-return]
 
 

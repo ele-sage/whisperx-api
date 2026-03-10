@@ -88,7 +88,7 @@ def speech_to_text(
         default=False,
         description="Split stereo audio into separate channels for individual processing",
     ),
-) -> dict:
+) -> JSONResponse:
     """Transcribe an uploaded audio file and return the result synchronously.
 
     The response contains the full aligned (and optionally diarized)
@@ -129,12 +129,15 @@ def speech_to_text(
         
         processing_time = time.time() - start_time
         
-        return {
-            "status": "completed",
-            "duration": duration,
-            "processing_time": round(processing_time, 3),
-            **result
-        }
+        return JSONResponse(
+            status_code=200,
+            content={
+                "status": "completed",
+                "duration": duration,
+                "processing_time": round(processing_time, 3),
+                **result,
+            },
+        )
     except Exception as exc:
         logger.exception("Processing failed for %s", file.filename)
         return JSONResponse(
@@ -144,6 +147,9 @@ def speech_to_text(
                 "error": str(exc),
                 "segments": [],
                 "word_segments": [],
+                "duration": 0.0,
+                "processing_time": 0.0,
+                "is_stereo": False,
             },
         )
     finally:
