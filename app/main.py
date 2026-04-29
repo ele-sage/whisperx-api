@@ -26,7 +26,7 @@ from fastapi.responses import JSONResponse
 
 from app.audio import get_audio_duration_from_file, safe_remove_file, validate_extension
 from app.config import ALLOWED_EXTENSIONS
-from app.processing import run_speech_to_text
+from app.processing import run_speech_to_text, run_transcribe_only
 from app.schemas import (
     AlignmentParams,
     ASROptions,
@@ -71,6 +71,30 @@ app = FastAPI(
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 
+# ── Helpers ──────────────────────────────────────────────────────────
+
+def _save_upload_to_tempfile(file: UploadFile) -> str:
+    """Validate and persist an uploaded file to a temporary path.
+
+    Returns the path to the temporary file.
+    Raises ``HTTPException`` (400) if the filename is missing or the
+    extension is not allowed.
+    """
+    if file.filename is None:
+        raise HTTPException(status_code=400, detail="Filename is missing")
+
+    try:
+        validate_extension(file.filename)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    _, ext = os.path.splitext(file.filename)
+    temp = NamedTemporaryFile(suffix=ext, delete=False)
+    temp.write(file.file.read())
+    temp.close()
+    return temp.name
+
+
 # ── Endpoints ────────────────────────────────────────────────────────
 
 # NOTE: This is a plain `def`, NOT `async def`.
@@ -96,22 +120,7 @@ def speech_to_text(
     transcription. If another request is already being processed, this
     one will block until the GPU is free.
     """
-    if file.filename is None:
-        raise HTTPException(status_code=400, detail="Filename is missing")
-
-    # Validate extension
-    try:
-        validate_extension(file.filename)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-
-    # Save upload to temp file
-    _, ext = os.path.splitext(file.filename)
-    temp = NamedTemporaryFile(suffix=ext, delete=False)
-    temp.write(file.file.read())
-    temp.close()
-    temp_path = temp.name
-
+    temp_path = _save_upload_to_tempfile(file)
     logger.info("Received file: %s (%s)", file.filename, temp_path)
 
     try:
@@ -151,6 +160,64 @@ def speech_to_text(
                 "duration": 0.0,
                 "processing_time": 0.0,
                 "is_stereo": False,
+            },
+        )
+    finally:
+        safe_remove_file(temp_path)
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
+@app.post("/transcribe", tags=["Speech-to-Text"])
+def transcribe(
+    model_params: WhisperModelParams = Depends(),
+    asr_options: ASROptions = Depends(),
+    vad_options: VADOptions = Depends(),
+    file: UploadFile = File(...),
+) -> JSONResponse:
+    """Transcribe an uploaded audio file without alignment or diarization.
+
+    Returns raw transcription segments (``start``, ``end``, ``text``) and
+    the detected language.  Faster than ``/speech-to-text`` because the
+    alignment and diarization steps are skipped entirely.
+    """
+    temp_path = _save_upload_to_tempfile(file)
+    logger.info("Received file for transcription-only: %s (%s)", file.filename, temp_path)
+
+    try:
+        duration = get_audio_duration_from_file(temp_path)
+        start_time = time.time()
+
+        result = run_transcribe_only(
+            temp_file=temp_path,
+            model_params=model_params,
+            asr_options=asr_options,
+            vad_options=vad_options,
+        )
+
+        processing_time = time.time() - start_time
+
+        return JSONResponse(
+            status_code=200,
+            content={
+                "status": "completed",
+                "duration": duration,
+                "processing_time": round(processing_time, 3),
+                **result,
+            },
+        )
+    except Exception as exc:
+        logger.exception("Transcription-only failed for %s", file.filename)
+        return JSONResponse(
+            status_code=500,
+            content={
+                "status": "failed",
+                "error": str(exc),
+                "segments": [],
+                "language": "",
+                "duration": 0.0,
+                "processing_time": 0.0,
             },
         )
     finally:

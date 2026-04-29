@@ -42,6 +42,8 @@ from app.schemas import (
     DiarizationParams,
     LabeledSegment,
     LabeledWord,
+    TranscriptionResult,
+    TranscriptionSegment,
     VADOptions,
     WhisperModelParams,
 )
@@ -341,6 +343,43 @@ def run_speech_to_text(
 
     result["is_stereo"] = stereo
     return result  # type: ignore[no-any-return]
+
+
+def run_transcribe_only(
+    temp_file: str,
+    model_params: WhisperModelParams,
+    asr_options: ASROptions,
+    vad_options: VADOptions,
+) -> dict[str, Any]:
+    """Run transcription only (no alignment, no diarization) synchronously.
+
+    Audio loading happens OUTSIDE the GPU lock.  Returns a dict with
+    ``segments`` (each having ``start``, ``end``, ``text``) and
+    ``language``.
+    """
+    # ── Audio loading (CPU/IO — no lock needed) ──
+    start_cpu_io = time.time()
+    audio = process_audio_file(temp_file)
+    logger.debug("Audio loaded in %.2fs", time.time() - start_cpu_io)
+
+    # ── GPU work (transcribe only) ──
+    with transcription_lock():
+        start_transcribe = time.time()
+        raw = transcription_model.transcribe(audio, model_params, asr_options, vad_options)
+        logger.debug("Transcription step took %.2fs", time.time() - start_transcribe)
+
+    del audio
+
+    segments = [
+        TranscriptionSegment(
+            start=seg["start"],
+            end=seg["end"],
+            text=seg["text"],
+        )
+        for seg in raw.get("segments", [])
+    ]
+    result = TranscriptionResult(segments=segments, language=raw.get("language", ""))
+    return result.model_dump()
 
 
 def _run_split_audio(

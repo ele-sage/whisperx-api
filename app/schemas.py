@@ -109,6 +109,17 @@ class DiarizationParams(BaseModel):
 
 # ── Result models ────────────────────────────────────────────────────
 
+class TranscriptionSegment(BaseModel):
+    start: float
+    end: float
+    text: str
+
+
+class TranscriptionResult(BaseModel):
+    segments: list[TranscriptionSegment]
+    language: str
+
+
 class Word(BaseModel):
     word: str
     start: float | None = None
